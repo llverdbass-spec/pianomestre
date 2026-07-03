@@ -1,0 +1,33 @@
+PIANO MESTRE — paquet per pujar a un servei web
+================================================
+
+Contingut:
+  index.html            l'app (tota l'app és en aquest fitxer)
+  manifest.webmanifest  fitxa d'app per a "Afegir a pantalla d'inici"
+  sw.js                 service worker: l'app funciona sense connexió un cop visitada
+  icons/                icones (favicon, iOS, Android/PWA i 1024 per a botigues)
+
+Com publicar-ho (tria'n una):
+
+OPCIÓ A — Netlify Drop (la més ràpida, sense compte de pagament)
+  1. Ves a https://app.netlify.com/drop
+  2. Arrossega-hi la CARPETA sencera (o aquest zip)
+  3. Et dona una adreça https://....netlify.app a l'instant
+
+OPCIÓ B — GitHub Pages
+  1. Crea un repositori nou a github.com
+  2. Puja-hi TOTS els fitxers d'aquesta carpeta (a l'arrel del repositori)
+  3. Settings > Pages > Source: "Deploy from a branch" > branca main > Save
+  4. En 1-2 minuts: https://ELTEUUSUARI.github.io/NOMDELREPO/
+
+Després, a l'iPad/iPhone:
+  1. Obre l'adreça amb Safari
+  2. Botó Compartir > "Afegir a pantalla d'inici"
+  3. L'app queda instal·lada amb la seva icona, a pantalla completa,
+     i funciona fins i tot sense connexió
+
+Micròfon: la primera vegada que premis "Activar micròfon", Safari
+demanarà permís. Cal que l'adreça sigui https (les dues opcions ho són).
+
+Important: NO canviïs el nom d'index.html — els servidors web serveixen
+automàticament aquest fitxer com a pàgina d'inici.
