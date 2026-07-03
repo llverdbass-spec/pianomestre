@@ -556,7 +556,7 @@ function judge(midi, fromMic){
   const target = currentTarget();
   const el = keyEls[midi];
   if(midi===target){
-    state.lockUntil = performance.now()+ (fromMic? 650 : 250);
+    state.lockUntil = performance.now()+ (fromMic? 400 : 250);
     el && el.classList.add("good");
     $("target-note").classList.add("flash-ok");
     $("feedback").textContent = ["Molt bé!","Perfecte!","Exacte!","Així mateix!","Genial!"][Math.floor(Math.random()*5)];
@@ -566,7 +566,7 @@ function judge(midi, fromMic){
     setTimeout(updateStep, fromMic? 450 : 350);
   } else {
     state.errors++;
-    state.lockUntil = performance.now()+ (fromMic? 500 : 120);
+    state.lockUntil = performance.now()+ (fromMic? 400 : 120);
     el && el.classList.add("bad");
     setTimeout(()=>el && el.classList.remove("bad"), 420);
     $("target-note").classList.add("flash-bad");
@@ -613,6 +613,8 @@ async function toggleMic(){
     src.connect(an);
     state.analyser = an;
     state.micOn = true;
+    state.armed = true; state.lastTrigMidi = null; state.minSince = 1;
+    state.stableNote = null; state.stableCount = 0; state.lockUntil = 0;
     $("btn-mic").textContent = "🎙️ Micròfon actiu";
     $("btn-mic").classList.add("mic-on");
     $("tuner-label").innerHTML = "Escoltant… toca una nota al teu piano";
@@ -632,7 +634,9 @@ function stopMic(){
   $("needle").style.left="50%";
 }
 
-/* Autocorrelació (ACF2+) — robusta per a piano */
+/* Detecció de to: autocorrelació normalitzada amb rang de retards limitat.
+   És ~8x més ràpida que l'ACF completa (apta per a iPad) i tria el PRIMER pic
+   de correlació per evitar errors d'octava amb els harmònics del piano. */
 const buf = new Float32Array(4096);
 let byteBuf = null;
 function readTimeDomain(an){
@@ -643,54 +647,84 @@ function readTimeDomain(an){
     for(let i=0;i<buf.length;i++) buf[i]=(byteBuf[i]-128)/128;
   }
 }
+const corrBuf = new Float32Array(512);
 function detectPitch(an, sampleRate){
   readTimeDomain(an);
-  let SIZE = buf.length;
+  const SIZE = buf.length;
   let rms = 0;
-  for(let i=0;i<SIZE;i++){ rms += buf[i]*buf[i]; }
+  for(let i=0;i<SIZE;i++) rms += buf[i]*buf[i];
   rms = Math.sqrt(rms/SIZE);
-  if(rms < 0.012) return {freq:-1,rms};             // massa fluix
+  if(rms < 0.008) return {freq:-1, rms};          // massa fluix
 
-  let r1=0, r2=SIZE-1; const thres=0.2;
-  for(let i=0;i<SIZE/2;i++) if(Math.abs(buf[i])<thres){ r1=i; break; }
-  for(let i=1;i<SIZE/2;i++) if(Math.abs(buf[SIZE-i])<thres){ r2=SIZE-i; break; }
-  const sl = buf.slice(r1,r2); SIZE = sl.length;
-  if(SIZE<128) return {freq:-1,rms};
+  const minLag = Math.floor(sampleRate/1100);      // límit agut (~Do6)
+  const maxLag = Math.min(corrBuf.length-2, Math.ceil(sampleRate/170)); // límit greu (~Sol3)
+  const W = SIZE - maxLag;
 
-  const c = new Float32Array(SIZE);
-  for(let i=0;i<SIZE;i++)
-    for(let j=0;j<SIZE-i;j++) c[i] += sl[j]*sl[j+i];
+  let r0 = 0;
+  for(let j=0;j<W;j++) r0 += buf[j]*buf[j];
+  if(r0 <= 0) return {freq:-1, rms};
 
-  let d=0; while(d+1<SIZE && c[d]>c[d+1]) d++;
-  let maxval=-1, maxpos=-1;
-  for(let i=d;i<SIZE;i++){ if(c[i]>maxval){ maxval=c[i]; maxpos=i; } }
-  let T0 = maxpos;
-  if(T0<=0) return {freq:-1,rms};
-  const x1=c[T0-1]||0, x2=c[T0], x3=c[T0+1]||0;
+  let best = 0;
+  for(let lag=minLag; lag<=maxLag; lag++){
+    let sum = 0;
+    for(let j=0;j<W;j++) sum += buf[j]*buf[j+lag];
+    const v = sum/r0;
+    corrBuf[lag] = v;
+    if(v > best) best = v;
+  }
+  if(best < 0.5) return {freq:-1, rms};            // so no periòdic (soroll)
+
+  // primer pic local per sobre del 90% del màxim = període fonamental
+  const thr = best*0.9;
+  let lag = -1;
+  for(let l=minLag+1; l<maxLag; l++){
+    if(corrBuf[l]>=thr && corrBuf[l]>=corrBuf[l-1] && corrBuf[l]>=corrBuf[l+1]){ lag=l; break; }
+  }
+  if(lag < 0) return {freq:-1, rms};
+  // interpolació parabòlica per afinar el període
+  const x1=corrBuf[lag-1], x2=corrBuf[lag], x3=corrBuf[lag+1];
   const a=(x1+x3-2*x2)/2, b=(x3-x1)/2;
-  if(a) T0 = T0 - b/(2*a);
-  return {freq: sampleRate/T0, rms};
+  const shift = a ? -b/(2*a) : 0;
+  return {freq: sampleRate/(lag+shift), rms};
 }
 
 function listenLoop(){
   if(!state.micOn) return;
-  const {freq} = detectPitch(state.analyser, state.audioCtx.sampleRate);
-  if(freq>26 && freq<4200){
-    const midiF = 69 + 12*Math.log2(freq/440);
+  const res = detectPitch(state.analyser, state.audioCtx.sampleRate);
+  const now = performance.now();
+
+  /* Seguiment del nivell de so per detectar NOUS atacs:
+     després de validar una nota, cal silenci o un cop nou (el volum torna a
+     pujar per sobre del mínim recent) per rearmar. Això permet notes repetides. */
+  if(res.rms < state.minSince) state.minSince = res.rms;
+  if(!state.armed){
+    if(res.rms < 0.008 || res.rms > Math.max(0.02, state.minSince*2.5)){
+      state.armed = true; state.stableNote = null; state.stableCount = 0;
+    }
+  }
+
+  if(res.freq > 0){
+    const midiF = 69 + 12*Math.log2(res.freq/440);
     const midi = Math.round(midiF);
     const cents = (midiF - midi)*100;
     const n = midiToName(midi);
-    $("tuner-label").innerHTML = `S'ha sentit: <b>${catName(n)} (${n})</b> · ${freq.toFixed(1)} Hz`;
+    $("tuner-label").innerHTML = `S'ha sentit: <b>${catName(n)} (${n})</b> · ${res.freq.toFixed(1)} Hz`;
     $("needle").style.left = (50 + Math.max(-50,Math.min(50,cents)))+"%";
-    // estabilitat: cal la mateixa nota 3 fotogrames seguits
+
     if(midi===state.stableNote) state.stableCount++;
     else { state.stableNote=midi; state.stableCount=1; }
-    if(state.stableCount===4 && performance.now()>state.lockUntil){
+
+    /* dispara amb 3 fotogrames estables; una nota DIFERENT de l'última validada
+       pot disparar sense rearmar (lligat), la mateixa nota necessita nou atac */
+    if(state.stableCount>=3 && (state.armed || midi!==state.lastTrigMidi) && now>state.lockUntil){
       judge(midi, true);
-      state.stableCount=-8; // evita retriggers immediats de la mateixa vibració
+      state.armed = false;
+      state.lastTrigMidi = midi;
+      state.minSince = res.rms;
+      state.stableCount = 0;
     }
-  } else {
-    $("needle").style.left="50%";
+  } else if(res.rms < 0.008){
+    $("needle").style.left = "50%";
   }
   state.rafId = requestAnimationFrame(listenLoop);
 }
